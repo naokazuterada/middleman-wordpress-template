@@ -1,5 +1,20 @@
 # frozen_string_literal: true
-require 'extensions/pull_before_build'
+require 'fileutils'
+require 'find'
+
+
+###
+# Settings
+###
+
+# deploy先のブランチ名
+DeployBranch = 'staging'
+
+# URL設定
+StagingUrl = 'https://stg.example.com'
+ProductionUrl = 'https://example.com'
+WordPressThemeName = 'portfolio'
+
 
 ###
 # Page options, layouts, aliases and proxies
@@ -15,10 +30,18 @@ set :slim, pretty: true, sort_attrs: false, format: :html
 # Multiple languages
 # activate :i18n
 
-activate :asset_hash
+# buildに時間がかかるので無視してあとで複製する
+ignore /wp\/.*/
 
+# htmlにbuildされてしまわないように無視
+ignore /.*\.php/
+
+activate :asset_hash, ignore: ['wp/*']
+
+# 注意: html2twigの中で、directory_indexesなファイルが検知できないため、有効化しないで対応すること
+# ref: README.mdのKnown Errors
 # URL access xxx.hmtl -> /xxx/
-activate :directory_indexes
+# activate :directory_indexes
 
 activate :automatic_image_sizes
 
@@ -32,12 +55,10 @@ activate :external_pipeline,
          source: '.tmp/dist',
          latency: 1
 
-activate :pull_before_build
-
 activate :deploy do |deploy|
   deploy.deploy_method = :git
   deploy.build_before = true
-  deploy.branch = 'master'
+  deploy.branch = DeployBranch
 end
 
 # Per-page layout changes:
@@ -61,13 +82,55 @@ configure :development do
   activate :livereload
 end
 
+def html2twig(path)
+  src = "build/#{path}.html"
+  dest = "build/wp/wp-content/themes/#{WordPressThemeName}/templates/#{path}"
+  parent_dir = File.dirname(dest)
+  p "convert_to_twig: #{dest}.twig"
+  FileUtils.mkdir_p(parent_dir) unless Dir.exists?(parent_dir)
+  FileUtils.mv(src, "#{dest}.twig")
+end
+
 # Build-specific configuration
 configure :build do
-  # Minify CSS on build
-  # activate :minify_css
+  activate :minify_css
+  activate :minify_javascript
 
-  # Minify Javascript on build
-  # activate :minify_javascript
+  after_build do
+
+    # buildで無視していたwp以下を複製
+    FileUtils.cp_r('source/wp', 'build/', preserve: true, remove_destination: true)
+
+    # source/wp以下以外にあるphpを複製
+    Dir['source/**/*.php'].reject{ |f| f['source/wp'] }.each do |item|
+      dest = item.gsub(/^source\//,'build/')
+      FileUtils.cp_r(item, dest, preserve: true, remove_destination: true)
+    end
+
+    p "htmlをリネームしてtwigファイル作成して、tempaltesに移動..."
+    sitemap.resources.each do |item|
+      if item.path.match(/\.html$/)
+        path = item.path.gsub(/\.html$/,'')
+        html2twig(path)
+      end
+    end
+
+    p "空のディレクトリを削除..."
+    n = 0
+    Find.find('build/') do |path|
+      if FileTest.directory?(path)
+        if Dir.entries(path).join == "..."
+          unless path.match(/(\/\.git|\/\.sass-cache|\/wp\/)/)
+            p "Delete: #{path}"
+            Dir.rmdir(path)
+            n += 1
+          end
+        end
+      end
+    end
+    p "Deleted #{n} directories."
+
+  end
 end
 
 ###
@@ -75,23 +138,17 @@ end
 ###
 
 helpers do
-  def site_url
-    'https://example.com'
-  end
-
   def current_page?(path)
     current_page.url == path
   end
 
   # support high res images
-  # Usage: =img_tag '/img/example.png', alt: 'description'
   def img_tag(src, options = {})
     # enable to set attributes in options
     retina_src = src.gsub(/\.\w+$/, '@2x\0')
     image_tag(src, options.merge(srcset: "#{retina_src} 2x"))
   end
 
-  # Usage: =img_tag_sp '/img/example.png', alt: 'description'
   def img_tag_sp(src, options = {})
     sp_src = src.gsub(/\.\w+$/, '-sp\0')
 
@@ -133,5 +190,15 @@ helpers do
 
   def other_langs
     langs - [I18n.locale]
+  end
+
+  def site_url
+    if config[:environment] == :development
+      'http://localhost:4567'
+    elsif DeployBranch == 'staging'
+      StagingUrl
+    else
+      ProductionUrl
+    end
   end
 end
